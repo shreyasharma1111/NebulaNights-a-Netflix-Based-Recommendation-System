@@ -1,0 +1,141 @@
+# Install necessary libraries (uncomment to install)
+# !pip install tqdm
+# !pip install pandas
+# !pip install scikit-learn
+
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
+import statistics
+
+# Suppress warnings
+def warn(*args, **kwargs):
+    pass
+
+import warnings
+warnings.warn = warn
+warnings.filterwarnings('ignore')
+
+# Load datasets
+movie_df = pd.read_csv('https://cf-courses-data.s3.us.cloud-object-storage.appdomain.cloud/BxZuF3FrO7Bdw6McwsBaBw/movies.csv')
+rating_df = pd.read_csv('https://cf-courses-data.s3.us.cloud-object-storage.appdomain.cloud/R-bYYyyf7s3IUE5rsssmMw/ratings.csv')
+tag_df = pd.read_csv('https://cf-courses-data.s3.us.cloud-object-storage.appdomain.cloud/UZKHhXSl7Ft7t9mfUFZJPQ/tags.csv')
+
+# Merge dataframes
+user_movie_df = movie_df.merge(rating_df, on='movieId', how='inner')
+df = user_movie_df.merge(tag_df, on=['movieId', 'userId'], how='inner')
+
+# Drop unnecessary columns
+df.drop(columns=['timestamp_x', 'timestamp_y'], inplace=True)
+
+# Calculate number of votes and average ratings
+num_votes = df.groupby('movieId').size().reset_index(name='numVotes')
+df = pd.merge(df, num_votes, on='movieId')
+
+avg_ratings = df.groupby('movieId')['rating'].mean().reset_index(name='avgRating')
+df = pd.merge(df, avg_ratings, on='movieId')
+
+df.drop_duplicates(subset=['movieId', 'title', 'avgRating', 'numVotes'], inplace=True)
+
+# Calculate the weighted score (adjust for popularity and rating)
+def calculate_weighted_score(avgRating, num_votes, C, m):
+    return (num_votes * avgRating + m * C) / (num_votes + m)
+
+average_rating = statistics.mean(df['avgRating'])
+avg_num_votes = statistics.mean(df['numVotes'])
+
+df['score'] = df.apply(lambda row: calculate_weighted_score(row['avgRating'], row['numVotes'], average_rating, avg_num_votes), axis=1)
+
+# Create 'features' column for text-based similarity (genres + tags)
+df_2 = df[['movieId', 'title', 'userId', 'avgRating', 'numVotes', 'score', 'genres', 'tag']].copy()
+df_2.reset_index(drop=True, inplace=True)
+df_2['features'] = df_2['genres'].str.replace('|', ' ') + ' ' + df_2['tag'].fillna('')
+
+# Convert features into a TF-IDF matrix
+vectorizer = TfidfVectorizer(stop_words='english')
+X = vectorizer.fit_transform(df_2['features'])
+
+# Compute cosine similarity
+similarity = cosine_similarity(X)
+
+# Recommendation function using content-based filtering (cosine similarity)
+def recommendation(title, df, similarity, top_n=3):
+    try:
+        idx = df[df['title'] == title].index[0]
+    except IndexError:
+        print(f"Movie '{title}' not found in the dataset.")
+        return
+
+    sim_scores = list(enumerate(similarity[idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+
+    print(f"\nMovies similar to '{title}' (First movie is itself):")
+    for i, (index, score) in enumerate(sim_scores[:top_n+1]):
+        movie = df.iloc[index]
+        print(f"{i}. {movie['title']} (Similarity Score: {score:.3f})")
+        print(f"   Genres: {movie['genres']}")
+        print(f"   Tag: {movie['tag']}\n")
+
+# Collaborative filtering - create a user-item matrix from ratings
+user_rating_matrix = rating_df.pivot(index="movieId", columns="userId", values="rating")
+user_rating_matrix = user_rating_matrix.fillna(0)
+
+# Fit Nearest Neighbors model for collaborative filtering
+rec = NearestNeighbors(metric='cosine')
+rec.fit(user_rating_matrix)
+
+# Function for collaborative filtering recommendations
+def get_recommendations(title, df_2, user_rating_matrix, rec, top_n=3):
+    # Get movie details
+    movie = df_2[df_2['title'] == title]
+    
+    if movie.empty:
+        print(f"Movie '{title}' not found in dataset.")
+        return None
+    
+    movie_id = int(movie['movieId'])
+    
+    # Get the index of the movie in the user-item matrix
+    try:
+        user_index = user_rating_matrix.index.get_loc(movie_id)
+    except KeyError:
+        print(f"Movie ID {movie_id} not found in the user rating matrix.")
+        return None
+    
+    # Get the user ratings for the movie
+    user_ratings = user_rating_matrix.iloc[user_index]
+    
+    # Reshape the ratings to be a single sample (1, -1)
+    reshaped_df = user_ratings.values.reshape(1, -1)
+    
+    # Find the nearest neighbors (similar movies)
+    distances, indices = rec.kneighbors(reshaped_df, n_neighbors=top_n+1)
+    
+    # Get the movieIds of the nearest neighbors (excluding the first, which is the queried movie itself)
+    nearest_idx = user_rating_matrix.iloc[indices[0]].index[1:]
+    
+    # Get the movie details for the nearest neighbors
+    nearest_neighbors = pd.DataFrame({'movieId': nearest_idx})
+    result = pd.merge(nearest_neighbors, df_2, on='movieId', how='left')
+    
+    # Return the top recommendations
+    return result[['title', 'avgRating', 'genres']].head(top_n)
+
+# Main recommendation interface (using both content and collaborative filtering)
+def get_movie_recommendations():
+    # Get user input for the movie title
+    title = input("Enter a movie title you're interested in: ")
+    
+    print("\n--- Content-based Recommendations (Based on Genres and Tags) ---")
+    recommendation(title, df_2, similarity, top_n=5)
+    
+    print("\n--- Collaborative Filtering Recommendations (Based on User Ratings) ---")
+    rec_result = get_recommendations(title, df_2, user_rating_matrix, rec, top_n=5)
+    
+    if rec_result is not None:
+        for idx, row in rec_result.iterrows():
+            print(f"{row['title']} (Rating: {row['avgRating']}, Genres: {row['genres']})")
+
+# Run the recommendation system
+get_movie_recommendations()
